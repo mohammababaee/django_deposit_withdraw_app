@@ -57,10 +57,20 @@ def process_single_withdrawal(withdrawal_id):
 
     logger.info(f"Processing withdrawal {withdrawal_id}: {withdrawal.amount} from wallet {withdrawal.wallet.uuid}")
 
+    if withdrawal.wallet.balance - withdrawal.amount <= 0:
+        withdrawal.status = ScheduledWithdrawal.FAILED
+        withdrawal.error_message = 'Insufficient balance: wallet balance would reach zero or below'
+        withdrawal.save()
+        logger.warning(
+            f"Withdrawal {withdrawal_id} failed: balance after withdrawal would be "
+            f"{withdrawal.wallet.balance - withdrawal.amount} for wallet {withdrawal.wallet.uuid}"
+        )
+        return
+
     with transaction.atomic():
         updated = Wallet.objects.filter(
             id=withdrawal.wallet_id,
-            balance__gte=withdrawal.amount,
+            balance__gt=withdrawal.amount,
         ).update(
             balance=F('balance') - withdrawal.amount,
         )
