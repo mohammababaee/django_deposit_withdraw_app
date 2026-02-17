@@ -72,19 +72,6 @@ This automatically starts:
 - Celery worker (background tasks)
 - Celery beat (scheduler - runs every minute)
 
-2. **Create a test wallet** (in a new terminal)
-```bash
-docker-compose exec web python manage.py shell
-```
-```python
-from wallets.models import Wallet
-wallet = Wallet.objects.create(balance=0)
-print(f"Wallet UUID: {wallet.uuid}")  # Save this for API calls
-exit()
-```
-
-3. **Test the API** - The service is now running at `http://localhost:8000`
-
 ## API Usage
 
 Replace `{wallet-uuid}` with your actual wallet UUID from step 2.
@@ -108,34 +95,6 @@ curl -X POST http://localhost:8000/wallets/{wallet-uuid}/withdraw \
   -d '{"amount": 100, "scheduled_for": "2026-02-16 18:30:00"}'
 ```
 **Note**: `scheduled_for` must be a future timestamp in format `YYYY-MM-DD HH:MM:SS`. The withdrawal will be processed automatically by Celery Beat when the scheduled time arrives.
-
-## Testing Concurrent Transactions
-
-Run the provided test script:
-```python
-# test_concurrent.py
-import requests
-import threading
-from datetime import datetime, timedelta
-
-url = "http://localhost:8000/wallets/{your-uuid}/deposit"
-
-def make_deposit():
-    response = requests.post(url, json={"amount": 100})
-    print(f"Status: {response.status_code}")
-
-threads = []
-for i in range(10):
-    thread = threading.Thread(target=make_deposit)
-    threads.append(thread)
-    thread.start()
-
-for thread in threads:
-    thread.join()
-```
-```bash
-python test_concurrent.py
-```
 
 ## How It Works
 
@@ -199,36 +158,6 @@ wallet/
 ├── docker-compose.yml
 ├── Dockerfile
 └── requirements.txt
-```
-
-## Development & Debugging
-
-### View Service Logs
-```bash
-# All services
-docker-compose logs -f
-
-# Specific service
-docker-compose logs -f celery_beat    # Scheduler logs
-docker-compose logs -f celery_worker  # Task execution logs
-docker-compose logs -f web            # Django API logs
-```
-
-### Access Django Shell
-```bash
-docker-compose exec web python manage.py shell
-```
-
-### Run Without Docker
-```bash
-# 1. Start PostgreSQL and Redis
-docker-compose up db redis
-
-# 2. In separate terminals:
-python manage.py migrate
-python manage.py runserver             # Terminal 1
-celery -A wallet worker -l info        # Terminal 2
-celery -A wallet beat -l info          # Terminal 3
 ```
 
 ## Key Design Decisions
