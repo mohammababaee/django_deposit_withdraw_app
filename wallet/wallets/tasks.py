@@ -2,12 +2,10 @@ import logging
 from datetime import timedelta
 
 import pytz
-import requests
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 from celery import shared_task
-from django.conf import settings
 
 from .models import ScheduledWithdrawal, Wallet, Transaction
 from .utils import request_third_party_deposit
@@ -45,19 +43,67 @@ def process_scheduled_withdrawals():
         process_single_withdrawal(wid)
 
 
-def process_single_withdrawal(withdrawal_id):
-    withdrawal = ScheduledWithdrawal.objects.filter(
+def _fetch_withdrawal(withdrawal_id):
+    return ScheduledWithdrawal.objects.filter(
         id=withdrawal_id,
-        status=ScheduledWithdrawal.PROCESSING
+        status=ScheduledWithdrawal.PROCESSING,
     ).select_related('wallet').first()
+
+
+def _deduct_balance(withdrawal):
+    with transaction.atomic():
+        updated = Wallet.objects.filter(
+            id=withdrawal.wallet_id,
+            balance__gte=withdrawal.amount,
+        ).update(
+            balance=F('balance') - withdrawal.amount,
+        )
+    return updated > 0
+
+
+def _finalize_success(withdrawal):
+    with transaction.atomic():
+        tx = Transaction.objects.create(
+            wallet=withdrawal.wallet,
+            amount=withdrawal.amount,
+            type=Transaction.WITHDRAW,
+        )
+        withdrawal.status = ScheduledWithdrawal.COMPLETED
+        withdrawal.transaction = tx
+        withdrawal.save()
+    logger.info(
+        f"Withdrawal {withdrawal.id} completed successfully: {withdrawal.amount} "
+        f"from wallet {withdrawal.wallet.uuid}"
+    )
+
+
+def _finalize_failure(withdrawal, error_message):
+    with transaction.atomic():
+        Wallet.objects.filter(id=withdrawal.wallet_id).update(
+            balance=F('balance') + withdrawal.amount
+        )
+        withdrawal.status = ScheduledWithdrawal.FAILED
+        withdrawal.error_message = error_message
+        withdrawal.save()
+    logger.error(
+        f"Withdrawal {withdrawal.id} failed: {error_message}. "
+        f"Amount refunded to wallet {withdrawal.wallet.uuid}"
+    )
+
+
+def process_single_withdrawal(withdrawal_id):
+    withdrawal = _fetch_withdrawal(withdrawal_id)
 
     if not withdrawal:
         logger.warning(f"Withdrawal {withdrawal_id} not found or not in PROCESSING state")
         return
 
-    logger.info(f"Processing withdrawal {withdrawal_id}: {withdrawal.amount} from wallet {withdrawal.wallet.uuid}")
+    logger.info(
+        f"Processing withdrawal {withdrawal_id}: {withdrawal.amount} from wallet {withdrawal.wallet.uuid} "
+        f"(current balance: {withdrawal.wallet.balance})"
+    )
 
-    if withdrawal.wallet.balance - withdrawal.amount <= 0:
+    if withdrawal.wallet.balance - withdrawal.amount < 0:
         withdrawal.status = ScheduledWithdrawal.FAILED
         withdrawal.error_message = 'Insufficient balance: wallet balance would reach zero or below'
         withdrawal.save()
@@ -67,23 +113,32 @@ def process_single_withdrawal(withdrawal_id):
         )
         return
 
-    with transaction.atomic():
-        updated = Wallet.objects.filter(
-            id=withdrawal.wallet_id,
-            balance__gt=withdrawal.amount,
-        ).update(
-            balance=F('balance') - withdrawal.amount,
+    if not _deduct_balance(withdrawal):
+        withdrawal.status = ScheduledWithdrawal.FAILED
+        withdrawal.error_message = 'Insufficient balance at execution time'
+        withdrawal.save()
+        logger.warning(
+            f"Withdrawal {withdrawal_id} failed: Insufficient balance at execution time "
+            f"for wallet {withdrawal.wallet.uuid}"
         )
+        return
 
-        if updated == 0:
-            withdrawal.status = ScheduledWithdrawal.FAILED
-            withdrawal.error_message = 'Insufficient balance at execution time'
-            withdrawal.save()
-            logger.warning(
-                f"Withdrawal {withdrawal_id} failed: Insufficient balance at execution time "
-                f"for wallet {withdrawal.wallet.uuid}"
-            )
-            return
+    try:
+        process_bank_call.delay(withdrawal_id)
+    except Exception as e:
+        logger.error(
+            f"Withdrawal {withdrawal_id}: failed to queue bank call ({e}). Refunding."
+        )
+        _finalize_failure(withdrawal, f"Failed to queue bank call: {str(e)}")
+
+
+@shared_task
+def process_bank_call(withdrawal_id):
+    withdrawal = _fetch_withdrawal(withdrawal_id)
+
+    if not withdrawal:
+        logger.warning(f"Bank call aborted: withdrawal {withdrawal_id} not found or not in PROCESSING state")
+        return
 
     bank_success = False
     error_message = None
@@ -99,32 +154,6 @@ def process_single_withdrawal(withdrawal_id):
         error_message = f'Unexpected error: {str(e)} - withdrawal amount refunded'
 
     if bank_success:
-        with transaction.atomic():
-            tx = Transaction.objects.create(
-                wallet=withdrawal.wallet,
-                amount=withdrawal.amount,
-                type=Transaction.WITHDRAW
-            )
-            withdrawal.status = ScheduledWithdrawal.COMPLETED
-            withdrawal.transaction = tx
-            withdrawal.save()
-        logger.info(
-            f"Withdrawal {withdrawal_id} completed successfully: {withdrawal.amount} "
-            f"from wallet {withdrawal.wallet.uuid}"
-        )
+        _finalize_success(withdrawal)
     else:
-
-        with transaction.atomic():
-
-            Wallet.objects.filter(id=withdrawal.wallet_id).update(
-                balance=F('balance') + withdrawal.amount
-            )
-
-            withdrawal.status = ScheduledWithdrawal.FAILED
-            withdrawal.error_message = error_message
-            withdrawal.save()
-
-        logger.error(
-            f"Withdrawal {withdrawal_id} failed: {error_message}. "
-            f"Amount refunded to wallet {withdrawal.wallet.uuid}"
-        )
+        _finalize_failure(withdrawal, error_message)
